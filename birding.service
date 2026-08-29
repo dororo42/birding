@@ -1,0 +1,18 @@
+[Unit]
+Description=Birding Service (YOLO RTSP)
+After=network.target
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 安全建议：生产环境可改为专用低权限用户（如 User=birding），并相应调整 IMAGE_ROOT 目录属主
+User=root
+WorkingDirectory=/home/birding
+# 主程序已内置 __main__ 入口（uvicorn.run），直接运行即可启动 Web 服务
+ExecStart=/home/birding/venv/bin/python3 /home/birding/birding_service.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

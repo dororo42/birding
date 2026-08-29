@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# 环境变量（含敏感配置）
+.env
+.env.*
+!.env.example
+
+# 模型权重（首次运行由 ultralytics 自动下载）
+*.pt
+yolov8n.pt
+
+# 模型 / 转换产物（体积大，不纳入版本库；本地使用请自行转换或下载）
+*.rknn
+*.onnx
+
+# 运行期产生的截图（体积随时间增长）
+bird_image/
+
+# 系统/IDE
+.DS_Store
+Thumbs.db
+.workbuddy/
+
+# 历史/参考版本（已移入 archive/，不纳入版本库）
+archive/
+
+# 部署助手（含局域网 SSH 凭据，不公开）
+_ssh_run.py
