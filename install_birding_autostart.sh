@@ -79,6 +79,8 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=$APP_DIR
+Environment=DEBUG_MODE=false
+TimeoutStopSec=15
 ExecStart=$VENV_DIR/bin/python3 $APP_DIR/$PY_FILE
 Restart=on-failure
 RestartSec=5

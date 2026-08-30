@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import cv2, time, threading, os, traceback, signal
+import cv2, time, threading, os, traceback, json, re
 import numpy as np
 from pathlib import Path
 from datetime import datetime, time as dtime
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Form, Query
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -31,8 +32,9 @@ USERNAME = "root"
 PASSWORD = "1234qwer"
 
 CONF_THRESHOLD = _env("CONF_THRESHOLD", 0.3, float)
-IOU_THRESHOLD = _env("IOU_THRESHOLD", 0.3, float)
-DEBUG_MODE = _env("DEBUG_MODE", True, lambda v: str(v).lower() in ("1", "true", "yes", "on"))
+IOU_THRESHOLD = _env("IOU_THRESHOLD", 0.3, float)          # 连续帧匹配 IoU
+NMS_IOU_THRESHOLD = _env("NMS_IOU_THRESHOLD", 0.5, float)  # 检测 NMS 阈值（CPU/NPU 统一）
+DEBUG_MODE = _env("DEBUG_MODE", False, lambda v: str(v).lower() in ("1", "true", "yes", "on"))  # 生产默认 False：非鸟不入库
 SAVE_COOLDOWN = _env("SAVE_COOLDOWN", 2, int)
 
 DETECT_EVERY_N_FRAMES = _env("DETECT_EVERY_N_FRAMES", 2, int)
@@ -43,11 +45,79 @@ DETECT_BACKEND = _env("DETECT_BACKEND", "cpu", str).lower()
 NPU_MODEL_PATH = _env("NPU_MODEL_PATH", "/home/birding/yolov8n_fp16.rknn", str)
 CPU_MODEL_PATH = _env("CPU_MODEL_PATH", "/home/birding/yolov8n.pt", str)
 
+# RTSP 拉流：TCP 传输抗丢包；RTSP_STREAM 可切子码流（如 ch0_1.h264）降低解码压力与延迟
+RTSP_TRANSPORT = _env("RTSP_TRANSPORT", "tcp", str).lower()
+RTSP_STREAM = _env("RTSP_STREAM", "ch0_0.h264", str)
+RTSP_READ_TIMEOUT_SEC = _env("RTSP_READ_TIMEOUT_SEC", 10, int)
+# rtsp_transport=tcp 抗丢包；stimeout(μs) 保证死流时 read 在超时后返回，拉流线程不会永久阻塞
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                      f"rtsp_transport;{RTSP_TRANSPORT}|stimeout;{RTSP_READ_TIMEOUT_SEC * 1000000}")
+
+# 运行时参数持久化（重启/断电后恢复，避免静默回退默认值）
+CONFIG_PATH = Path(_env("CONFIG_PATH", str(Path(__file__).resolve().parent / "config.json")))
+
 WORK_START = dtime(_env("WORK_START_HOUR", 5, int), 0)
 WORK_END = dtime(_env("WORK_END_HOUR", 17, int), 0)
 
 IMAGE_ROOT = Path(_env("IMAGE_ROOT", "/home/bird_image"))
 IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
+
+# ======================
+# 运行时参数持久化
+# ======================
+def _save_config():
+    try:
+        data = {
+            "camera_ip": CAMERA_IP,
+            "conf": CONF_THRESHOLD,
+            "iou_threshold": IOU_THRESHOLD,
+            "debug_mode": DEBUG_MODE,
+            "save_cooldown": SAVE_COOLDOWN,
+            "detect_every_n_frames": DETECT_EVERY_N_FRAMES,
+            "consecutive_frames_required": CONSECUTIVE_FRAMES_REQUIRED,
+            "detect_backend": DETECT_BACKEND,
+            "work_start_hour": WORK_START.hour,
+            "work_end_hour": WORK_END.hour,
+        }
+        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(CONFIG_PATH))
+    except Exception as e:
+        print(f"[{datetime.now()}] [警告] 参数持久化失败: {e}")
+
+def _load_config():
+    """启动时加载持久化参数（仅覆盖存在的键；凭据不持久化）。"""
+    global CAMERA_IP, CONF_THRESHOLD, IOU_THRESHOLD, DEBUG_MODE, SAVE_COOLDOWN
+    global DETECT_EVERY_N_FRAMES, CONSECUTIVE_FRAMES_REQUIRED, DETECT_BACKEND
+    global WORK_START, WORK_END
+    try:
+        if not CONFIG_PATH.exists():
+            return
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        if isinstance(data.get("camera_ip"), str) and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", data["camera_ip"]):
+            CAMERA_IP = data["camera_ip"]
+        v = data.get("conf");
+        if isinstance(v, (int, float)): CONF_THRESHOLD = max(0.1, min(0.9, float(v)))
+        v = data.get("iou_threshold")
+        if isinstance(v, (int, float)): IOU_THRESHOLD = max(0.1, min(0.9, float(v)))
+        if isinstance(data.get("debug_mode"), bool): DEBUG_MODE = data["debug_mode"]
+        v = data.get("save_cooldown")
+        if isinstance(v, int) and v > 0: SAVE_COOLDOWN = v
+        v = data.get("detect_every_n_frames")
+        if isinstance(v, int) and 1 <= v <= 10: DETECT_EVERY_N_FRAMES = v
+        v = data.get("consecutive_frames_required")
+        if isinstance(v, int) and 1 <= v <= 5: CONSECUTIVE_FRAMES_REQUIRED = v
+        if data.get("detect_backend") in ("cpu", "npu"): DETECT_BACKEND = data["detect_backend"]
+        vs, ve = data.get("work_start_hour"), data.get("work_end_hour")
+        if isinstance(vs, int) and 0 <= vs <= 23 and isinstance(ve, int) and 0 <= ve <= 23 and vs < ve:
+            WORK_START = dtime(vs, 0); WORK_END = dtime(ve, 0)
+        print(f"[{datetime.now()}] [配置] 已加载持久化参数: {CONFIG_PATH}")
+    except Exception as e:
+        print(f"[{datetime.now()}] [警告] 读取持久化参数失败: {e}")
+
+_load_config()
 
 # ======================
 # 全局状态
@@ -105,7 +175,7 @@ class CPUDetector:
         self.model = YOLO(model_path)
         print(f"[{datetime.now()}] [模型] CPU后端加载成功: {model_path}")
     def detect(self, frame):
-        result = self.model.predict(frame, imgsz=640, conf=CONF_THRESHOLD, verbose=False, device='cpu')[0]
+        result = self.model.predict(frame, imgsz=640, conf=CONF_THRESHOLD, iou=NMS_IOU_THRESHOLD, verbose=False, device='cpu')[0]
         out = []
         if result.boxes:
             for b in result.boxes:
@@ -123,6 +193,23 @@ class NPUDetector:
         self.rk.load_rknn(model_path)
         self.rk.init_runtime()
         self.model_path = model_path
+        # RGA 2D 加速（可选）：letterbox 预处理交给硬件，失败自动回退 cv2
+        self.rga = None
+        self.rga_ok = False
+        if _env("RGA_ENABLED", 1, int) == 1:
+            try:
+                from rga_accel import RGAAccel, RK_FORMAT_BGR_888, RK_FORMAT_RGB_888
+                acc = RGAAccel()
+                if acc.ok:
+                    self.rga = acc
+                    self.rga_ok = True
+                    self.fmt_bgr = RK_FORMAT_BGR_888
+                    self.fmt_rgb = RK_FORMAT_RGB_888
+                    print(f"[{datetime.now()}] [模型] RGA 加速已启用 (rga_shim)" )
+                else:
+                    print(f"[{datetime.now()}] [模型] RGA 不可用，回退 cv2 预处理: {acc.err}")
+            except Exception as e:
+                print(f"[{datetime.now()}] [模型] RGA 初始化异常，回退 cv2 预处理: {e}")
         print(f"[{datetime.now()}] [模型] NPU后端加载成功: {model_path}")
     def _decode(self, box_raw, score_raw, conf, iou):
         # box_raw: (4,8400) xywh; score_raw: (80,8400) 已是概率(0~1)，无需再 sigmoid
@@ -141,18 +228,27 @@ class NPUDetector:
                                float(bx[idx[k],2]), float(bx[idx[k],3]))))
         return final
     def detect(self, frame):
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = img.shape[:2]
+        h, w = frame.shape[:2]
         scale = min(640 / w, 640 / h)
         nw, nh = int(round(w * scale)), int(round(h * scale))
-        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
         canvas = np.full((640, 640, 3), 114, dtype=np.uint8)
         pad_x = (640 - nw) // 2; pad_y = (640 - nh) // 2
-        canvas[pad_y:pad_y+nh, pad_x:pad_x+nw, :] = resized
+        if self.rga_ok:
+            # RGA 硬件路径：BGR 整帧 → RGB 640 letterbox（填边+缩放两步都在 RGA 内）
+            rc = self.rga.letterbox(frame, w, h, self.fmt_bgr,
+                                    canvas, 640, 640, self.fmt_rgb,
+                                    114, pad_x, pad_y, nw, nh)
+            if rc != 0:
+                print(f"[{datetime.now()}] [警告] RGA letterbox 失败 rc={rc}，本次起回退 cv2")
+                self.rga_ok = False
+        if not self.rga_ok:
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            canvas[pad_y:pad_y+nh, pad_x:pad_x+nw, :] = resized
         inp = np.expand_dims(canvas, 0)  # (1,640,640,3) uint8 NHWC
         out = self.rk.inference(inputs=[inp], data_format='nhwc')[0]
         out = np.squeeze(out)            # (84,8400)
-        dets = self._decode(out[:4, :], out[4:, :], CONF_THRESHOLD, IOU_THRESHOLD)
+        dets = self._decode(out[:4, :], out[4:, :], CONF_THRESHOLD, NMS_IOU_THRESHOLD)
         result = []
         for cls, conf, (x1, y1, x2, y2) in dets:
             ox1 = (x1 - pad_x) / scale; oy1 = (y1 - pad_y) / scale
@@ -164,9 +260,11 @@ class NPUDetector:
 
 detector = None
 def get_detector():
-    global detector
+    global detector, DETECT_BACKEND
     if detector is None:
-        detector, _ = _build_detector()
+        detector, actual = _build_detector()
+        # 如实回写实际后端：NPU 加载失败回退 CPU 时，/status 不再虚报 npu
+        DETECT_BACKEND = actual
     return detector
 
 def _build_detector():
@@ -186,7 +284,10 @@ def reload_detector():
     return actual
 
 def rtsp_url():
-    return f"rtsp://{USERNAME}:{PASSWORD}@{CAMERA_IP}:554/ch0_0.h264"
+    return f"rtsp://{USERNAME}:{PASSWORD}@{CAMERA_IP}:554/{RTSP_STREAM}"
+
+def rtsp_url_masked():
+    return f"rtsp://{USERNAME}:***@{CAMERA_IP}:554/{RTSP_STREAM}"
 
 def in_work_time():
     now = datetime.now().time()
@@ -223,6 +324,10 @@ def filter_new_detections(boxes):
     """按位置去重：仅丢弃仍处于冷却中的位置，新位置仍可保存（修复原逻辑整体漏存问题）。"""
     global last_save_time
     current_time = time.time()
+    # 定期清理过期记录，防止长期运行下字典无限增长
+    if len(last_save_time) > 256:
+        last_save_time = {k: v for k, v in last_save_time.items()
+                          if current_time - v < max(600, SAVE_COOLDOWN * 10)}
     new_boxes = []
     if not boxes:
         return new_boxes
@@ -241,7 +346,6 @@ class ConsecutiveDetector:
         self.required_frames = required_frames
         self.current_streak = 0
         self.last_boxes = []
-        self.confirmed_hashes = set()
 
     def update(self, boxes):
         if not boxes:
@@ -250,17 +354,9 @@ class ConsecutiveDetector:
             return False, []
 
         if self.required_frames <= 1:
-            new_boxes = []
-            for box in boxes:
-                box_hash = get_position_hash(box)
-                if box_hash not in self.confirmed_hashes:
-                    new_boxes.append(box)
-                    self.confirmed_hashes.add(box_hash)
-            if new_boxes:
-                if DEBUG_MODE:
-                    print(f"  [确认] 首帧确认，保存{len(new_boxes)}个目标")
-                return True, new_boxes
-            return False, []
+            # 首帧即确认；同位置冷却统一交给 filter_new_detections 的 SAVE_COOLDOWN 处理
+            # （修复：原 confirmed_hashes 永不过期，导致同一位置整个时段只存 1 张）
+            return True, boxes
 
         if self.last_boxes:
             overlap_count = 0
@@ -285,7 +381,6 @@ class ConsecutiveDetector:
     def reset(self):
         self.current_streak = 0
         self.last_boxes = []
-        self.confirmed_hashes.clear()
 
 consecutive_detector = ConsecutiveDetector(required_frames=CONSECUTIVE_FRAMES_REQUIRED)
 
@@ -333,27 +428,66 @@ def save_frame(frame, boxes=None, confidences=None, prefix=""):
         traceback.print_exc()
         return None
 
+class FrameReader(threading.Thread):
+    """独立拉流线程：持续 cap.read() 只保留最新帧，推理不再阻塞读流，
+    避免检测耗时导致 RTSP 缓冲积压、预览/截图延迟越拉越大（修复 P1-5）。"""
+
+    def __init__(self, cap):
+        super().__init__(daemon=True)
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ts = 0.0
+        self.started_ts = time.time()   # 首帧到达前 idle 以启动时间为基准，避免误判死流
+        self.stopped = threading.Event()
+
+    def run(self):
+        fail = 0
+        while not self.stopped.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                fail += 1
+                if fail > 30:            # 连续读取失败视为流断开
+                    return
+                time.sleep(0.02)
+                continue
+            fail = 0
+            with self.lock:
+                self.frame = frame
+                self.ts = time.time()
+
+    def get(self, max_age=0.5):
+        with self.lock:
+            if self.frame is None or time.time() - self.ts > max_age:
+                return None
+            return self.frame.copy()   # 返回副本，推理/保存可安全持有
+
+    def idle_seconds(self):
+        ref = self.ts if self.ts > 0 else self.started_ts
+        return time.time() - ref
+
+    def stop(self):
+        self.stopped.set()
+
 def capture_loop():
     global latest_frame, latest_frame_ts, latest_boxes, latest_confidences
-    global system_state, frame_counter, consecutive_detector
-    global CAMERA_IP  # 确保使用最新值
+    global system_state, frame_counter, consecutive_detector, detector
+    global CAMERA_IP, DETECT_BACKEND  # 确保使用最新值
 
     print(f"[{datetime.now()}] [启动] 观鸟系统启动")
     print(f"[{datetime.now()}] [配置] 阈值:{CONF_THRESHOLD}, 间隔:{DETECT_EVERY_N_FRAMES}帧, 确认:{CONSECUTIVE_FRAMES_REQUIRED}帧")
     print(f"[{datetime.now()}] [配置] 图片保存路径: {IMAGE_ROOT}")
 
     try:
-        global detector
-        detector = get_detector()
+        detector = get_detector()   # NPU 失败会回退 CPU，DETECT_BACKEND 回写为实际后端
     except Exception as e:
-        print(f"[{datetime.now()}] [致命错误] 模型加载失败，服务无法启动")
+        print(f"[{datetime.now()}] [致命错误] 模型加载失败，服务无法启动: {e}")
         system_state = "ERROR"
         return
 
     retry_count = 0
-    max_retries = 100
 
-    while not stop_event.is_set() and retry_count < max_retries:
+    while not stop_event.is_set():
         # 检查是否需要重启（IP 切换触发）
         if restart_event.is_set():
             print(f"[{datetime.now()}] [重启] 检测到IP变更，重新连接摄像头...")
@@ -365,7 +499,7 @@ def capture_loop():
             if system_state != "SLEEPING":
                 print(f"[{datetime.now()}] [状态] 进入休眠时段")
                 system_state = "SLEEPING"
-            time.sleep(30)
+            stop_event.wait(30)
             continue
 
         system_state = "OFFLINE"
@@ -374,26 +508,27 @@ def capture_loop():
         try:
             cap = cv2.VideoCapture(rtsp_url(), cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FPS, 15)
         except Exception as e:
             print(f"[{datetime.now()}] [错误] VideoCapture创建失败: {e}")
-            time.sleep(5)
-            retry_count += 1
+            stop_event.wait(5)
             continue
 
         if not cap.isOpened():
+            # 无限重试 + 指数退避（2s→60s 封顶）；修复原 100 次后线程永久死亡问题
             retry_count += 1
-            print(f"[{datetime.now()}] [错误] 无法连接摄像头({retry_count}/{max_retries})，2秒后重试...")
-            print(f"  [调试] RTSP地址: {rtsp_url()}")
-            time.sleep(2)
+            delay = min(60, 2 ** min(retry_count, 6))
+            print(f"[{datetime.now()}] [错误] 无法连接摄像头({retry_count})，{delay}秒后重试... [{rtsp_url_masked()}]")
+            stop_event.wait(delay)
             continue
 
-        print(f"[{datetime.now()}] [状态] 摄像头连接成功: {CAMERA_IP}")
+        print(f"[{datetime.now()}] [状态] 摄像头连接成功: {CAMERA_IP} ({RTSP_TRANSPORT.upper()} / {RTSP_STREAM})")
         system_state = "RUNNING"
         retry_count = 0
-        fail_count = 0
         frame_counter = 0
         consecutive_detector.reset()
+
+        reader = FrameReader(cap)
+        reader.start()
 
         while not stop_event.is_set() and in_work_time():
             # 检查IP是否被修改
@@ -401,20 +536,20 @@ def capture_loop():
                 print(f"[{datetime.now()}] [切换] IP变更 {current_ip} -> {CAMERA_IP}")
                 break  # 跳出内层循环，重新连接
 
+            # 拉流线程死亡或长时间无新帧 → 重连
+            if not reader.is_alive() or reader.idle_seconds() > 10:
+                print(f"[{datetime.now()}] [错误] 拉流线程异常/无新帧，重新连接...")
+                break
+
             try:
-                ret, frame = cap.read()
-                if not ret:
-                    fail_count += 1
-                    if fail_count > 10:
-                        print(f"[{datetime.now()}] [错误] 读取失败次数过多，重新连接...")
-                        break
-                    time.sleep(0.05)
+                frame = reader.get(max_age=2.0)
+                if frame is None:
+                    time.sleep(0.02)
                     continue
 
-                fail_count = 0
                 frame_counter += 1
                 with state_lock:
-                    latest_frame = frame.copy()
+                    latest_frame = frame
                     latest_frame_ts = time.time()
 
                 if frame_counter % DETECT_EVERY_N_FRAMES != 0:
@@ -475,6 +610,12 @@ def capture_loop():
                 traceback.print_exc()
                 time.sleep(1)
 
+        # 停止拉流线程并释放摄像头（FFMPEG stimeout 保证阻塞的 read 会在超时后返回）
+        try:
+            reader.stop()
+            reader.join(timeout=12)
+        except Exception:
+            pass
         try:
             cap.release()
         except Exception:
@@ -485,9 +626,17 @@ def capture_loop():
 
         system_state = "OFFLINE"
         consecutive_detector.reset()
-        time.sleep(2)
+        stop_event.wait(2)
 
-app = FastAPI(title="Birding Camera System v4")
+@asynccontextmanager
+async def lifespan(_app):
+    # 停机时置位 stop_event：MJPEG 生成器与采集线程随之退出，uvicorn 可秒级优雅退出
+    # （修复：原模块级 signal 处理器被 uvicorn 覆盖，stop_event 永不置位，重启被 systemd 强杀）
+    yield
+    stop_event.set()
+    print(f"[{datetime.now()}] [停机] lifespan shutdown，已通知采集线程与视频流退出")
+
+app = FastAPI(title="Birding Camera System v5", lifespan=lifespan)
 # 内网服务：关闭 credentials，避免与 allow_origins=['*'] 冲突且无实际用途
 app.add_middleware(
     CORSMiddleware,
@@ -515,7 +664,11 @@ def index(request: Request):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "state": system_state}
+    unhealthy = system_state in ("ERROR", "DEAD")
+    return JSONResponse(
+        content={"status": "unhealthy" if unhealthy else "ok", "state": system_state},
+        status_code=503 if unhealthy else 200,
+    )
 
 @app.get("/status")
 def status():
@@ -536,12 +689,16 @@ def status():
 @app.post("/update_camera")
 def update_camera(ip: str = Form(...)):
     global CAMERA_IP
+    ip = ip.strip()
+    if not re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip) or any(int(o) > 255 for o in ip.split(".")):
+        return {"ok": False, "message": "IP 格式无效，应为如 192.168.2.222 的 IPv4 地址"}
     old_ip = CAMERA_IP
     CAMERA_IP = ip
     print(f"[{datetime.now()}] [配置] 摄像头IP: {old_ip} -> {ip}")
 
     # 触发重新连接
     restart_event.set()
+    _save_config()
 
     return {"ok": True, "ip": CAMERA_IP, "message": f"已切换到 {ip}，正在重新连接..."}
 
@@ -550,6 +707,7 @@ def update_yolo(conf: float = Form(...)):
     global CONF_THRESHOLD
     CONF_THRESHOLD = max(0.1, min(0.9, conf))
     print(f"[{datetime.now()}] [配置] 阈值改为: {CONF_THRESHOLD}")
+    _save_config()
     return {"ok": True, "message": f"YOLO 置信度已更新为 {CONF_THRESHOLD:.2f}"}
 
 @app.post("/update_backend")
@@ -571,8 +729,10 @@ def update_backend(backend: str = Form(...)):
     if actual != backend:
         # 请求的 NPU 不可用，已静默回退 CPU —— 如实回报，避免 UI 误显示 NPU
         DETECT_BACKEND = actual
+        _save_config()
         return {"ok": True, "backend": actual, "fallback": True,
                 "message": f"{backend.upper()} 不可用，已回退 {actual.upper()}"}
+    _save_config()
     return {"ok": True, "backend": actual, "message": f"检测后端已切换为 {actual.upper()}"}
 
 # 不同后端的优化推荐参数（基于实测性能：CPU ~0.1 FPS，NPU ~1.7 FPS / ~12x）
@@ -594,8 +754,13 @@ def recommended_params():
 @app.post("/update_worktime")
 def update_worktime(start: int = Form(...), end: int = Form(...)):
     global WORK_START, WORK_END
+    if not (0 <= start <= 23 and 0 <= end <= 23):
+        return {"ok": False, "message": "小时数应在 0-23 之间"}
+    if start >= end:
+        return {"ok": False, "message": "开始小时必须早于结束小时（暂不支持跨夜时段）"}
     WORK_START = dtime(start, 0)
     WORK_END = dtime(end, 0)
+    _save_config()
     return {"ok": True, "message": f"观察时段已更新: {start:02d}:00 - {end:02d}:00"}
 
 @app.post("/update_detection_params")
@@ -605,6 +770,7 @@ def update_detection_params(interval: int = Form(...), consecutive: int = Form(.
     CONSECUTIVE_FRAMES_REQUIRED = max(1, min(5, consecutive))
     consecutive_detector = ConsecutiveDetector(required_frames=CONSECUTIVE_FRAMES_REQUIRED)
     print(f"[{datetime.now()}] [配置] 检测间隔:{DETECT_EVERY_N_FRAMES}, 确认帧数:{CONSECUTIVE_FRAMES_REQUIRED}")
+    _save_config()
     return {"ok": True, "message": f"检测参数已更新: 每{DETECT_EVERY_N_FRAMES}帧检测，需连续{CONSECUTIVE_FRAMES_REQUIRED}帧确认"}
 
 @app.post("/snapshot")
@@ -625,8 +791,10 @@ def snapshot_simple():
 
 @app.get("/api/photos")
 def get_photos(date: str = Query(None), limit: int = Query(50)):
-    if date is None:
-        date = datetime.now().strftime("%Y%m%d")
+    # date 仅接受 YYYYMMDD，防路径穿越；limit 加上限
+    if not (date and re.match(r"^\d{8}$", date)):
+        return JSONResponse(status_code=400, content={"error": "invalid date, expected YYYYMMDD"})
+    limit = max(1, min(limit, 200))
     base_path = IMAGE_ROOT / date
     if not base_path.exists():
         return {"date": date, "photos": [], "count": 0}
@@ -685,26 +853,23 @@ def video_feed():
                             cv2.putText(frame, label, (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     except Exception:
                         continue
-                _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                 yield (b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
-                time.sleep(0.05)
+                time.sleep(0.1)   # 预览限帧 10fps：编码是观看端 CPU 大头，预览无需 20fps
             except Exception as e:
                 time.sleep(0.1)
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 # ======================
-# 优雅停机 & 入口
+# 启动采集线程 & 入口
 # ======================
-def _handle_shutdown(signum, _frame):
-    print(f"[{datetime.now()}] [停机] 收到信号 {signum}，正在停止采集线程...")
-    stop_event.set()
-
-signal.signal(signal.SIGTERM, _handle_shutdown)
-signal.signal(signal.SIGINT, _handle_shutdown)
+# 停机处理由 lifespan 完成：uvicorn 会接管 SIGTERM/SIGINT，模块级 signal 处理器
+# 在两种启动方式下都不会被触发（死代码），已移除。
 
 capture_thread = threading.Thread(target=capture_loop, daemon=True)
 capture_thread.start()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # access_log=False：前端每秒轮询 /status，避免 journal 每天堆数万行访问日志
+    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)

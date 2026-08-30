@@ -59,14 +59,19 @@ birding/
 | `CAMERA_IP` | `192.168.2.222` | 摄像头 IP |
 | `USERNAME` / `PASSWORD` | `root` / `1234qwer` | 摄像头 RTSP 鉴权账号密码 |
 | `CONF_THRESHOLD` | `0.3` | 检测置信度阈值（也可 Web 实时调） |
-| `IOU_THRESHOLD` | `0.3` | 去重 IoU 阈值 |
-| `DEBUG_MODE` | `True` | 调试日志开关（生产可设 `False`） |
+| `IOU_THRESHOLD` | `0.3` | 连续帧匹配 IoU（去重匹配用） |
+| `NMS_IOU_THRESHOLD` | `0.5` | 检测 NMS 阈值（CPU / NPU 后端统一使用） |
+| `DEBUG_MODE` | `False` | 调试日志开关；**生产默认 False，仅入库鸟类**（True 时非鸟类别也会存盘，仅调试用） |
 | `SAVE_COOLDOWN` | `2` | 同位置再次保存冷却（秒） |
 | `DETECT_EVERY_N_FRAMES` | `2` | 每 N 帧做一次推理 |
 | `CONSECUTIVE_FRAMES_REQUIRED` | `1` | 连续确认帧数 |
 | `WORK_START` / `WORK_END` | `05:00` / `17:00` | 观察时段，时段外休眠不检测 |
 | `IMAGE_ROOT` | `/home/bird_image` | 截图归档根目录（按 `YYYYMMDD/` 与 `thumb/` 分存） |
 | `BIRD_CLASS_ID` | `14` | COCO 类别 14 = 鸟（YOLOv8n 沿用 COCO 80 类） |
+| `RTSP_TRANSPORT` | `tcp` | RTSP 传输协议（tcp 抗丢包；udp 易花屏） |
+| `RTSP_STREAM` | `ch0_0.h264` | RTSP 路径；可改 `ch0_1.h264` 子码流降低解码压力与延迟 |
+| `RTSP_READ_TIMEOUT_SEC` | `10` | RTSP 读超时（秒），死流时自动断开重连 |
+| `CONFIG_PATH` | `/home/birding/config.json` | 运行时参数持久化文件（Web 修改的参数重启后自动恢复） |
 | `DETECT_BACKEND` | `cpu` | 检测后端：`cpu`（默认，兼容性强）或 `npu`（Rockchip NPU / float16 RKNN，约 12× 更快、精度一致） |
 | `NPU_MODEL_PATH` | `/home/birding/yolov8n_fp16.rknn` | NPU 后端模型路径（float16 RKNN） |
 | `CPU_MODEL_PATH` | `/home/birding/yolov8n.pt` | CPU 后端模型路径（YOLOv8n PT） |
@@ -76,10 +81,12 @@ birding/
 > 摄像头 IP / 阈值 / 时段 / 检测参数均可通过 Web 界面（POST 接口）在运行时动态修改，无需改代码重启。
 >
 > **环境变量覆盖（可选）**：除摄像头凭据外，其余运行参数均可用环境变量覆盖默认值，便于容器/不同场地部署：
-> `CONF_THRESHOLD`、`IOU_THRESHOLD`、`DEBUG_MODE`、`SAVE_COOLDOWN`、`DETECT_EVERY_N_FRAMES`、
+> `CONF_THRESHOLD`、`IOU_THRESHOLD`、`NMS_IOU_THRESHOLD`、`DEBUG_MODE`、`SAVE_COOLDOWN`、`DETECT_EVERY_N_FRAMES`、
 > `CONSECUTIVE_FRAMES_REQUIRED`、`WORK_START_HOUR`、`WORK_END_HOUR`、`IMAGE_ROOT`、
-> `DETECT_BACKEND`、`NPU_MODEL_PATH`、`CPU_MODEL_PATH`。
+> `DETECT_BACKEND`、`NPU_MODEL_PATH`、`CPU_MODEL_PATH`、`RTSP_TRANSPORT`、`RTSP_STREAM`、`RTSP_READ_TIMEOUT_SEC`、`CONFIG_PATH`。
 > 摄像头凭据（`USERNAME`/`PASSWORD`/`CAMERA_IP`）按需求保留为源码内的硬编码默认值。
+>
+> **参数持久化**：Web 界面修改的参数（IP/阈值/时段/检测参数/后端）会自动写入 `CONFIG_PATH`，重启/断电后自动恢复；删除该文件即回退默认值。
 
 ---
 
@@ -177,8 +184,8 @@ Restart=on-failure
 
 1. **设备网络**：原部署机使用 NetworkManager 管理 `eth0`（有线）与 `wlan1`（USB 网卡）。
    本服务的可访问性依赖设备网络配置，迁移到新板时请单独配置网络。
-2. **模型类别**：当前仅识别 COCO 类别 14（鸟）。`DEBUG_MODE=True` 时会把其它类别也框出便于调试，
-   生产环境设 `False` 仅保留鸟类。
+2. **模型类别**：当前仅识别 COCO 类别 14（鸟）。**生产默认 `DEBUG_MODE=False`，仅入库鸟类**；
+   设 `True` 时其它类别也会存盘与绘制，仅调试用。检测 NMS 统一用 `NMS_IOU_THRESHOLD=0.5`（CPU/NPU 一致）。
 3. **图片落盘**：`/home/bird_image` 会随运行持续增长，建议定期清理或挂载大容量存储。
 4. **安全性**：`birding.service` 以 `root` 运行、监听 `0.0.0.0:8000` 且无鉴权。
    局域网调试可接受；若暴露到公网，务必加反向代理鉴权并改为非 root 用户运行（`birding.service` 已留 `User=birding` 注释示例）。
@@ -196,3 +203,28 @@ Restart=on-failure
    - **运行时热切换**：`POST /update_backend`（form `backend=cpu|npu`）可在不重启进程的情况下切换后端。
    - **转换脚本**：`python3 convert_rknn_fp16.py`（依赖 `rknn-toolkit2` 与 `ultralytics`；ONNX 用 `ultralytics export` 生成，imgsz=640、opset=13、simplify=True）。
    - **前端控制**：Web 控制台「检测后端」面板可一键切换 CPU / NPU（调用 `POST /update_backend`，状态随 `/status` 同步）；「优化推荐参数」面板按当前后端给出推荐值（CPU 降频省算力 / NPU 每帧检测）并可一键应用（数据来自 `GET /recommended_params`）。
+
+---
+
+## 8. 2026-08-30 修复记录（对应审查报告）
+
+- **P0-1 拉流重试**：取消 100 次上限，改为无限重试 + 指数退避（2s→60s 封顶），摄像头中途恢复即可自动续拍；此前重试耗尽后采集线程会永久死亡。
+- **P0-2 DEBUG_MODE 默认 False**：非鸟类别不再入库；单元文件显式 Environment=DEBUG_MODE=false 兜底。
+- **P1-1 日志脱敏**：连接失败仅打印掩码地址（`rtsp://user:***@ip`），不再泄露密码到 journald。
+- **P1-2 参数持久化**：Web 修改的参数自动写入 config.json（原子写），重启/断电自动恢复，不再静默回退默认值。
+- **P1-3 优雅停机**：lifespan shutdown 置位 stop_event，MJPEG/采集线程随之退出；TimeoutStopSec=15；带流重启从 10s+SIGKILL 降为秒级。
+- **P1-4 接口加固**：/api/photos 的 date 仅接受 YYYYMMDD（堵路径穿越），limit 上限 200。
+- **P1-5 拉流架构**：独立 FrameReader 线程只保留最新帧，推理不再阻塞读流，延迟不再累积；RTSP 强制 TCP + 读超时；RTSP_STREAM 可切子码流。
+- **P2-1 去重语义统一**：移除永不过期的 confirmed_hashes，同位置冷却统一由 SAVE_COOLDOWN 控制（默认 2s）。
+- **P2-2 healthz 分级**：ERROR 状态返回 503，不再假活。
+- **P2-3 时段校验**：开始小时必须早于结束小时（暂不支持跨夜）。
+- **P3**：NMS 阈值 CPU/NPU 统一、冷却字典自动清理、IP 格式校验、日期高亮保留、关闭 access_log 等。
+
+## 9. V5 前端升级（2026-08-30）
+
+- 版本号 v4 → **v5**（页面标题 / logo / FastAPI title / README 同步）。
+- 摄像头设置：`IP地址 [输入框] [切换]` 合并为紧凑一行。
+- 检测后端：删除按钮下方"推理后端：…"状态文字（与悬停提示重复），当前后端由激活按钮心跳/脉冲高亮表达。
+- 悬停提示防遮挡：CPU/NPU 按钮的提示气泡改为向侧栏内侧对齐（CPU 左对齐、NPU 右对齐），不再溢出被裁。
+- 优化推荐参数：删除说明行；置信度/间隔/确认三项并排一行；加载失败提示改显示在应用按钮上。
+- script.js 缓存破坏 `?v=4`。

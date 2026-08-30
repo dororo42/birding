@@ -4,10 +4,6 @@ let currentPhotoIndex = 0;
 let currentDate = null;
 let lastPhotoSig = "";  // 用于增量刷新：仅当照片集合变化时才重渲染
 let currentBackendName = "cpu";  // 当前检测后端（由 /status 同步，作为推荐参数依据）
-const BACKEND_INFO = {
-    cpu: "推理后端：CPU（通用 · 兼容最好 · 约 0.1 FPS）",
-    npu: "推理后端：NPU（RK3566 · 约 1.7 FPS · 约 12× 加速）"
-};
 
 // 更新状态和调试信息
 async function updateStatus() {
@@ -33,13 +29,11 @@ async function updateStatus() {
         document.getElementById("save-count").textContent = data.save_counter || 0;
         document.getElementById("frame-count").textContent = data.frame_counter || 0;
 
-        // 后端状态同步（按钮心跳 + 状态文字，不再用“当前后端”文本徽标）
+        // 后端状态同步：激活按钮加心跳/脉冲高亮（状态文字已删，与悬停提示重复）
         const backend = (data.backend || "cpu").toLowerCase();
         currentBackendName = backend;
         document.getElementById("btn-cpu").classList.toggle("active-cpu", backend === "cpu");
         document.getElementById("btn-npu").classList.toggle("active-npu", backend === "npu");
-        const st = document.getElementById("backend-status-text");
-        if (st) st.textContent = BACKEND_INFO[backend] || ("推理后端：" + backend.toUpperCase());
         renderRecommended();
     } catch (e) {
         console.error("状态更新失败:", e);
@@ -132,9 +126,10 @@ async function loadRecommended() {
         renderRecommended();
     } catch (e) {
         console.error("加载推荐参数失败:", e);
-        const note = document.getElementById("rec-note");
-        if (note) note.textContent = "推荐参数加载失败，3 秒后重试…";
-        setTimeout(loadRecommended, 3000);  // 失败后自动重试，避免一直卡在“加载中”
+        // 失败提示放在应用按钮上（说明行已删），3 秒后自动重试
+        const btn = document.getElementById("btn-apply-rec");
+        if (btn) { btn.textContent = "推荐参数加载失败，重试中…"; btn.disabled = true; }
+        setTimeout(loadRecommended, 3000);
     }
 }
 
@@ -148,7 +143,8 @@ function renderRecommended() {
     document.getElementById("rec-conf").textContent = rec.conf.toFixed(2);
     document.getElementById("rec-interval").textContent = rec.interval + "帧";
     document.getElementById("rec-consecutive").textContent = rec.consecutive + "帧";
-    document.getElementById("rec-note").textContent = rec.note;
+    const btn = document.getElementById("btn-apply-rec");
+    if (btn) { btn.textContent = "一键应用推荐参数"; btn.disabled = false; }
 }
 
 async function applyRecommended() {
@@ -215,7 +211,8 @@ async function loadDates() {
 
         data.dates.forEach((dateInfo, index) => {
             const chip = document.createElement("div");
-            chip.className = "date-chip" + (index === 0 ? " active" : "");
+            // 保留当前选中日期的高亮（修复：每 30s 重渲染会把高亮重置回第一项）
+            chip.className = "date-chip" + (dateInfo.date === currentDate ? " active" : "");
             chip.textContent = dateInfo.display;
             chip.onclick = () => selectDate(dateInfo.date, chip);
             selector.appendChild(chip);

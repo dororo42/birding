@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🐦 智能观鸟系统 v4</title>
+    <title>🐦 智能观鸟系统 v5</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -331,13 +331,16 @@
         .btn-backend { width: 100%; }
         .backend-tip {
             visibility: hidden; opacity: 0;
-            position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
-            width: 230px; background: #0b1220; color: var(--text-primary);
+            position: absolute; bottom: calc(100% + 8px);
+            width: 220px; background: #0b1220; color: var(--text-primary);
             border: 1px solid var(--border); border-radius: 0.5rem;
             padding: 0.5rem 0.65rem; font-size: 0.75rem; line-height: 1.45;
             z-index: 50; transition: opacity 0.15s; pointer-events: none;
             box-shadow: 0 8px 20px rgba(0,0,0,0.45);
         }
+        /* 靠边的按钮提示向内对齐，避免超出侧栏被裁剪（修复 CPU 提示偏左遮挡） */
+        .backend-btn-wrap:first-child .backend-tip { left: 0; }
+        .backend-btn-wrap:last-child .backend-tip { right: 0; }
         .backend-btn-wrap:hover .backend-tip { visibility: visible; opacity: 1; }
         .btn-backend.active-cpu {
             background: var(--accent); border-color: var(--accent); color: #fff;
@@ -355,16 +358,17 @@
             0%, 100% { box-shadow: 0 0 0 0 rgba(6,182,212,0.6); }
             50% { box-shadow: 0 0 0 9px rgba(6,182,212,0); }
         }
-        .backend-status {
-            margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-secondary);
-            padding: 0.4rem 0.6rem; background: var(--bg-card); border-radius: 0.4rem;
-        }
+        .backend-status { display: none; }
+        /* 推荐参数：三项并排一行 */
+        .rec-row { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.75rem; }
+        .rec-item { flex: 1; display: flex; align-items: center; gap: 0.3rem; font-size: 0.8rem; color: var(--text-secondary); white-space: nowrap; }
+        .rec-item .badge { font-size: 0.72rem; }
     </style>
 <base target="_blank">
 </head>
 <body>
     <header class="header">
-        <div class="logo">🐦 智能观鸟系统 v4</div>
+        <div class="logo">🐦 智能观鸟系统 v5</div>
         <div class="status-badge" id="status-badge">
             <span class="status-dot"></span>
             <span id="status-text">初始化中...</span>
@@ -392,10 +396,10 @@
             <div>
                 <div class="panel-title">摄像头设置</div>
                 <div class="control-group">
-                    <label class="control-label">IP 地址</label>
-                    <div style="display: flex; gap: 0.5rem;">
-                        <input type="text" class="input-field" id="camera-ip" value="{{camera_ip}}" placeholder="192.168.x.x">
-                        <button class="btn" onclick="updateCamera()">切换</button>
+                    <div style="display: flex; gap: 0.5rem; align-items: center;">
+                        <span class="control-label" style="white-space: nowrap;">IP地址</span>
+                        <input type="text" class="input-field" id="camera-ip" value="{{camera_ip}}" placeholder="192.168.x.x" style="flex: 1; min-width: 0;">
+                        <button class="btn" onclick="updateCamera()" style="white-space: nowrap;">切换</button>
                     </div>
                 </div>
             </div>
@@ -412,19 +416,17 @@
                         <span class="backend-tip">NPU 后端：Rockchip RK3566 加速（float16 RKNN），约 12× 更快（约 1.7 FPS）、精度与 CPU 一致。需板载 NPU 与 rknn 驱动；切换失败自动回退 CPU。</span>
                     </div>
                 </div>
-                <div class="backend-status" id="backend-status-text">推理后端：CPU</div>
-                <div class="debug-info" style="margin-top: 0.5rem;">当前激活的后端按钮会心跳闪烁；切换无需重启，NPU 不可用会自动回退并在上方提示。</div>
+                <div class="debug-info" style="margin-top: 0.5rem;">当前激活的后端按钮会心跳闪烁；切换无需重启，NPU 不可用会自动回退并以弹窗提示。</div>
             </div>
 
             <div>
                 <div class="panel-title">优化推荐参数</div>
-                <div class="debug-info" id="rec-note" style="margin-bottom: 0.75rem;">加载中...</div>
-                <div class="control-group" style="margin-bottom: 0.5rem; font-size: 0.8rem; color: var(--text-secondary);">
-                    <div>置信度阈值: <span id="rec-conf" class="badge">-</span></div>
-                    <div style="margin-top: 0.25rem;">检测间隔: <span id="rec-interval" class="badge">-</span></div>
-                    <div style="margin-top: 0.25rem;">确认帧数: <span id="rec-consecutive" class="badge">-</span></div>
+                <div class="rec-row">
+                    <div class="rec-item">置信度 <span id="rec-conf" class="badge">-</span></div>
+                    <div class="rec-item">间隔 <span id="rec-interval" class="badge">-</span></div>
+                    <div class="rec-item">确认 <span id="rec-consecutive" class="badge">-</span></div>
                 </div>
-                <button class="btn" onclick="applyRecommended()" style="width: 100%;">一键应用推荐参数</button>
+                <button class="btn" id="btn-apply-rec" onclick="applyRecommended()" style="width: 100%;">一键应用推荐参数</button>
             </div>
 
             <div>
@@ -502,6 +504,6 @@
         </div>
     </div>
 
-    <script src="/static/script.js?v=2"></script>
+    <script src="/static/script.js?v=4"></script>
 </body>
 </html>
