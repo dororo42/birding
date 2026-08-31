@@ -173,6 +173,23 @@
 
         .content-title { font-size: 1.25rem; font-weight: 600; }
 
+        .photo-actions { display: flex; gap: 0.5rem; align-items: center; }
+        .btn-sm { padding: 0.35rem 0.7rem; font-size: 0.8rem; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+        .btn:disabled:hover { transform: none; background: var(--accent); }
+        #btn-del:disabled:hover { background: var(--accent); }
+        #btn-del:hover:not(:disabled) { background: var(--danger); }
+        .photo-card .check {
+            position: absolute; top: 6px; left: 6px; width: 22px; height: 22px;
+            border-radius: 50%; background: rgba(0,0,0,0.55); border: 2px solid #fff;
+            display: none; align-items: center; justify-content: center;
+            font-size: 13px; color: transparent; z-index: 5;
+        }
+        .photo-card.selecting .check { display: flex; }
+        .photo-card.selected { outline: 2px solid var(--accent); }
+        .photo-card.selected .check { background: var(--accent); color: #fff; }
+        .photo-card.selected .check::after { content: "\2713"; }
+
         .date-selector { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
         .date-chip {
@@ -256,6 +273,14 @@
             background: none;
             border: none;
         }
+
+        .modal-del {
+            position: absolute; top: -2rem; right: 3rem;
+            background: var(--danger); border: none; color: white;
+            font-size: 0.85rem; padding: 0.45rem 1rem; border-radius: 0.4rem;
+            cursor: pointer;
+        }
+        .modal-del:hover { opacity: 0.85; }
 
         .modal-nav {
             position: absolute;
@@ -485,6 +510,11 @@
                 <h2 class="content-title">📷 照片墙</h2>
                 <div class="date-selector" id="date-selector"></div>
             </div>
+                <div class="photo-actions">
+                        <button class="btn btn-secondary btn-sm" id="btn-select" onclick="toggleSelectMode()">选择照片</button>
+                        <button class="btn btn-secondary btn-sm" id="btn-all" onclick="selectAllVisible()" style="display:none;">全选</button>
+                        <button class="btn btn-sm" id="btn-del" onclick="deleteSelected()" style="background:var(--danger);" disabled>删除照片</button>
+                </div>
 
             <div class="photo-grid" id="photo-wall">
                 <div class="empty-state">
@@ -498,12 +528,13 @@
     <div class="modal" id="image-modal">
         <div class="modal-content">
             <button class="modal-close" onclick="closeModal()">&times;</button>
+            <button class="modal-del" onclick="deleteCurrentPhoto()">删除照片</button>
             <button class="modal-nav modal-prev" onclick="navigateImage(-1)">&#8249;</button>
             <img class="modal-image" id="modal-image" src="" alt="查看大图">
             <button class="modal-nav modal-next" onclick="navigateImage(1)">&#8250;</button>
         </div>
     </div>
 
-    <script src="/static/script.js?v=4"></script>
+    <script src="/static/script.js?v=6"></script>
 </body>
 </html>

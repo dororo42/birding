@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import cv2, time, threading, os, traceback, json, re
+import cv2, time, threading, os, traceback, json, re, subprocess
 import numpy as np
 from pathlib import Path
 from datetime import datetime, time as dtime
@@ -46,9 +46,15 @@ NPU_MODEL_PATH = _env("NPU_MODEL_PATH", "/home/birding/yolov8n_fp16.rknn", str)
 CPU_MODEL_PATH = _env("CPU_MODEL_PATH", "/home/birding/yolov8n.pt", str)
 
 # RTSP 拉流：TCP 传输抗丢包；RTSP_STREAM 可切子码流（如 ch0_1.h264）降低解码压力与延迟
+# RTSP 拉流：TCP 传输抗丢包；RTSP_STREAM 可切子码流（如 ch0_1.h264）降低解码压力与延迟
 RTSP_TRANSPORT = _env("RTSP_TRANSPORT", "tcp", str).lower()
 RTSP_STREAM = _env("RTSP_STREAM", "ch0_0.h264", str)
 RTSP_READ_TIMEOUT_SEC = _env("RTSP_READ_TIMEOUT_SEC", 10, int)
+# 拉流后端：cv2（默认，FFmpeg 软解）| mpp（ffmpeg+rkmpp 硬解，需自编 ffmpeg）
+RTSP_BACKEND = _env("RTSP_BACKEND", "cv2", str).lower()
+FFMPEG_BIN = _env("FFMPEG_BIN", "/usr/local/bin/ffmpeg", str)
+MPPDEC_BIN = _env("MPPDEC_BIN", "/usr/local/bin/mppdec", str)
+RTSP_IDLE_SEC = _env("RTSP_IDLE_SEC", 10, int)   # 无帧空闲多久判定断流（慢码流可调大）
 # rtsp_transport=tcp 抗丢包；stimeout(μs) 保证死流时 read 在超时后返回，拉流线程不会永久阻塞
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
                       f"rtsp_transport;{RTSP_TRANSPORT}|stimeout;{RTSP_READ_TIMEOUT_SEC * 1000000}")
@@ -469,6 +475,116 @@ class FrameReader(threading.Thread):
     def stop(self):
         self.stopped.set()
 
+    def is_healthy(self):
+        return self.is_alive() and not self.stopped.is_set()
+
+class FrameReaderMPP(threading.Thread):
+    """mppdec 硬解管道读线程：ffmpeg(-c copy) | mppdec(VPU 解码) 输出
+    [FRM1][w u32][h u32][NV12] 帧序列，本线程解帧并转 BGR 存最新帧。
+    任一进程退出/帧头异常均置 fatal，调用方回退 cv2。"""
+
+    def __init__(self, url):
+        super().__init__(daemon=True)
+        self.url = url
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ts = 0.0
+        self.started_ts = time.time()
+        self.stopped = threading.Event()
+        self.width = 0
+        self.height = 0
+        self.proc = None
+        self.p1 = None
+        self.fatal = None
+
+    @staticmethod
+    def _read_exact(stream, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = stream.read(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def run(self):
+        ffmpeg_cmd = [FFMPEG_BIN, "-loglevel", "error",
+                      "-rtsp_transport", RTSP_TRANSPORT,
+                      "-timeout", "10000000",
+                      "-i", self.url, "-an", "-c:v", "copy", "-f", "h264", "-"]
+        mpp_cmd = [MPPDEC_BIN]
+        try:
+            p1 = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL)
+            err_f = open("/tmp/mppdec_err.log", "ab")
+            p2 = subprocess.Popen(mpp_cmd, stdin=p1.stdout,
+                                  stdout=subprocess.PIPE, stderr=err_f)
+            p1.stdout.close()  # 让 p1 在 p2 退出后收到 SIGPIPE
+        except Exception as e:
+            self.fatal = f"MPP 管道启动失败: {e}"
+            return
+        self.p1 = p1
+        self.proc = p2
+        try:
+            while not self.stopped.is_set():
+                if p2.poll() is not None:
+                    self.fatal = "mppdec 进程退出"
+                    return
+                hdr = self._read_exact(p2.stdout, 12)
+                if not hdr:
+                    self.fatal = "mppdec 输出结束"
+                    return
+                if hdr[:4] != b"FRM1":
+                    self.fatal = "帧头异常"
+                    return
+                w = int.from_bytes(hdr[4:8], "little")
+                h = int.from_bytes(hdr[8:12], "little")
+                payload = self._read_exact(p2.stdout, w * h * 3 // 2)
+                if not payload:
+                    self.fatal = "帧数据不完整"
+                    return
+                nv12 = np.frombuffer(payload, dtype=np.uint8).reshape(int(h * 1.5), w)
+                bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+                with self.lock:
+                    self.frame = bgr
+                    self.width, self.height = w, h
+                    self.ts = time.time()
+        except Exception as e:
+            self.fatal = f"MPP 读帧异常: {e}"
+
+    def get(self, max_age=2.0):
+        with self.lock:
+            if self.frame is None or time.time() - self.ts > max_age:
+                return None
+            return self.frame
+
+    def idle_seconds(self):
+        ref = self.ts if self.ts > 0 else self.started_ts
+        return time.time() - ref
+
+    def is_healthy(self):
+        return (self.is_alive() and self.fatal is None
+                and self.proc is not None and self.proc.poll() is None)
+
+    def stop(self):
+        self.stopped.set()
+        for p in (self.proc, self.p1):
+            try:
+                if p and p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+
+        def _reap():
+            time.sleep(2)
+            for p in (self.proc, self.p1):
+                try:
+                    if p and p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
+        threading.Thread(target=_reap, daemon=True).start()
+
 def capture_loop():
     global latest_frame, latest_frame_ts, latest_boxes, latest_confidences
     global system_state, frame_counter, consecutive_detector, detector
@@ -505,30 +621,51 @@ def capture_loop():
         system_state = "OFFLINE"
         current_ip = CAMERA_IP  # 记录当前IP，用于检测变化
 
-        try:
-            cap = cv2.VideoCapture(rtsp_url(), cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception as e:
-            print(f"[{datetime.now()}] [错误] VideoCapture创建失败: {e}")
-            stop_event.wait(5)
-            continue
+        reader = None
+        cap = None
+        if RTSP_BACKEND == "mpp":
+            try:
+                reader = FrameReaderMPP(rtsp_url())
+                reader.start()
+                t0 = time.time()
+                while reader.is_alive() and not reader.fatal and reader.frame is None and time.time() - t0 < 25:
+                    time.sleep(0.2)
+                if reader.fatal or not reader.is_alive() or reader.frame is None:
+                    raise RuntimeError(reader.fatal or "mppdec 未在 25s 内出帧")
+                print(f"[{datetime.now()}] [状态] MPP 硬解拉流已启动: {reader.width}x{reader.height}")
+            except Exception as e:
+                print(f"[{datetime.now()}] [警告] MPP 拉流失败，本次回退 cv2: {e}")
+                try:
+                    reader.stop()
+                except Exception:
+                    pass
+                reader = None
 
-        if not cap.isOpened():
-            # 无限重试 + 指数退避（2s→60s 封顶）；修复原 100 次后线程永久死亡问题
-            retry_count += 1
-            delay = min(60, 2 ** min(retry_count, 6))
-            print(f"[{datetime.now()}] [错误] 无法连接摄像头({retry_count})，{delay}秒后重试... [{rtsp_url_masked()}]")
-            stop_event.wait(delay)
-            continue
+        if reader is None:
+            try:
+                cap = cv2.VideoCapture(rtsp_url(), cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception as e:
+                print(f"[{datetime.now()}] [错误] VideoCapture创建失败: {e}")
+                stop_event.wait(5)
+                continue
 
-        print(f"[{datetime.now()}] [状态] 摄像头连接成功: {CAMERA_IP} ({RTSP_TRANSPORT.upper()} / {RTSP_STREAM})")
+            if not cap.isOpened():
+                # 无限重试 + 指数退避（2s→60s 封顶）；修复原 100 次后线程永久死亡问题
+                retry_count += 1
+                delay = min(60, 2 ** min(retry_count, 6))
+                print(f"[{datetime.now()}] [错误] 无法连接摄像头({retry_count})，{delay}秒后重试... [{rtsp_url_masked()}]")
+                stop_event.wait(delay)
+                continue
+
+            reader = FrameReader(cap)
+            reader.start()
+
+        print(f"[{datetime.now()}] [状态] 摄像头连接成功: {CAMERA_IP} ({RTSP_TRANSPORT.upper()} / {RTSP_STREAM} / 拉流={RTSP_BACKEND})")
         system_state = "RUNNING"
         retry_count = 0
         frame_counter = 0
         consecutive_detector.reset()
-
-        reader = FrameReader(cap)
-        reader.start()
 
         while not stop_event.is_set() and in_work_time():
             # 检查IP是否被修改
@@ -537,7 +674,7 @@ def capture_loop():
                 break  # 跳出内层循环，重新连接
 
             # 拉流线程死亡或长时间无新帧 → 重连
-            if not reader.is_alive() or reader.idle_seconds() > 10:
+            if not reader.is_alive() or reader.idle_seconds() > RTSP_IDLE_SEC or not reader.is_healthy():
                 print(f"[{datetime.now()}] [错误] 拉流线程异常/无新帧，重新连接...")
                 break
 
@@ -617,7 +754,8 @@ def capture_loop():
         except Exception:
             pass
         try:
-            cap.release()
+            if cap is not None:
+                cap.release()
         except Exception:
             pass
 
@@ -651,7 +789,7 @@ templates = Jinja2Templates(directory="frontend")
 
 @app.get("/")
 def index(request: Request):
-    return templates.TemplateResponse("index.html", {
+    resp = templates.TemplateResponse("index.html", {
         "request": request,
         "conf": CONF_THRESHOLD,
         "camera_ip": CAMERA_IP,
@@ -661,6 +799,8 @@ def index(request: Request):
         "detect_interval": DETECT_EVERY_N_FRAMES,
         "consecutive_required": CONSECUTIVE_FRAMES_REQUIRED
     })
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 @app.get("/healthz")
 def healthz():
@@ -815,6 +955,27 @@ def get_photos(date: str = Query(None), limit: int = Query(50)):
     except Exception as e:
         print(f"[错误] 读取照片列表失败: {e}")
     return {"date": date, "count": len(photos), "photos": photos}
+
+@app.post("/api/photos/delete")
+def delete_photos(date: str = Form(...), items: str = Form(...)):
+    """删除指定日期的照片（原图 + 缩略图一并删）。items 为逗号分隔的文件名。"""
+    if not re.match(r"^\d{8}$", date):
+        return JSONResponse(status_code=400, content={"error": "invalid date, expected YYYYMMDD"})
+    names = [n for n in items.split(",") if re.match(r"^[\w.-]+\.jpg$", n)]
+    if not names:
+        return JSONResponse(status_code=400, content={"error": "no valid filenames"})
+    base = IMAGE_ROOT / date
+    deleted = 0
+    for n in names:
+        for p in (base / n, base / "thumb" / n):
+            try:
+                if p.exists() and p.is_file():
+                    p.unlink()
+                    deleted += 1
+            except Exception as e:
+                print(f"[错误] 删除失败 {p}: {e}")
+    print(f"[{datetime.now()}] [删除] {date} 删除 {len(names)} 张照片（含缩略图共 {deleted} 个文件）")
+    return {"ok": True, "deleted": deleted, "count": len(names)}
 
 @app.get("/api/dates")
 def get_dates():

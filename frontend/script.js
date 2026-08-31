@@ -4,6 +4,8 @@ let currentPhotoIndex = 0;
 let currentDate = null;
 let lastPhotoSig = "";  // 用于增量刷新：仅当照片集合变化时才重渲染
 let currentBackendName = "cpu";  // 当前检测后端（由 /status 同步，作为推荐参数依据）
+let selectMode = false;        // 照片选择模式
+let selectedFiles = new Set(); // 已选文件名
 
 // 更新状态和调试信息
 async function updateStatus() {
@@ -274,13 +276,24 @@ function renderPhotos(photos) {
     wall.innerHTML = "";
     currentPhotos.forEach((photo, index) => {
         const card = document.createElement("div");
-        card.className = "photo-card";
-        card.onclick = () => openModal(index);
+        card.className = "photo-card" + (selectMode ? " selecting" : "");
+        if (selectedFiles.has(photo.filename)) card.classList.add("selected");
+        card.onclick = () => {
+            if (selectMode) {
+                if (selectedFiles.has(photo.filename)) selectedFiles.delete(photo.filename);
+                else selectedFiles.add(photo.filename);
+                card.classList.toggle("selected");
+                updateSelectUI();
+            } else {
+                openModal(index);
+            }
+        };
 
         const timeStr = photo.time.slice(0, 2) + ":" + photo.time.slice(2, 4) + ":" + photo.time.slice(4, 6);
         const sizeKB = (photo.size / 1024).toFixed(1);
 
         card.innerHTML = `
+            <span class="check"></span>
             <img class="photo-thumb" src="${photo.thumb_url}" loading="lazy" alt="鸟类照片">
             <div class="photo-info">
                 <div class="photo-time">${timeStr}</div>
@@ -302,6 +315,36 @@ function closeModal() {
     document.getElementById("image-modal").classList.remove("active");
 }
 
+async function deleteCurrentPhoto() {
+    const photo = currentPhotos[currentPhotoIndex];
+    if (!photo || !currentDate) return;
+    if (!confirm("确定删除这张照片？删除后不可恢复。")) return;
+    try {
+        const res = await fetch("/api/photos/delete", {
+            method: "POST",
+            body: new URLSearchParams({ date: currentDate, items: photo.filename })
+        });
+        const data = await res.json();
+        if (data.ok) {
+            showToast("已删除 1 张照片", "success");
+            currentPhotos.splice(currentPhotoIndex, 1);
+            lastPhotoSig = "";
+            if (currentPhotos.length === 0) {
+                closeModal();
+            } else {
+                if (currentPhotoIndex >= currentPhotos.length) currentPhotoIndex = 0;
+                document.getElementById("modal-image").src = currentPhotos[currentPhotoIndex].full_url;
+            }
+            await refreshPhotos(currentDate);
+            loadDates();
+        } else {
+            showToast(data.error || "删除失败", "error");
+        }
+    } catch (e) {
+        showToast("删除失败", "error");
+    }
+}
+
 function navigateImage(direction) {
     if (currentPhotos.length === 0) return;
     currentPhotoIndex += direction;
@@ -310,6 +353,52 @@ function navigateImage(direction) {
 
     const photo = currentPhotos[currentPhotoIndex];
     document.getElementById("modal-image").src = photo.full_url;
+}
+
+function updateSelectUI() {
+    const bSel = document.getElementById("btn-select");
+    const bAll = document.getElementById("btn-all");
+    const bDel = document.getElementById("btn-del");
+    if (bSel) bSel.textContent = selectMode ? "取消选择" : "选择照片";
+    if (bAll) bAll.style.display = selectMode ? "" : "none";
+    if (bDel) bDel.disabled = selectedFiles.size === 0;
+}
+
+function toggleSelectMode() {
+    selectMode = !selectMode;
+    selectedFiles.clear();
+    updateSelectUI();
+    renderPhotos(currentPhotos);
+}
+
+function selectAllVisible() {
+    currentPhotos.forEach(p => selectedFiles.add(p.filename));
+    updateSelectUI();
+    renderPhotos(currentPhotos);
+}
+
+async function deleteSelected() {
+    if (selectedFiles.size === 0) return;
+    if (!currentDate) return;
+    if (!confirm(`确定删除选中的 ${selectedFiles.size} 张照片？删除后不可恢复。`)) return;
+    try {
+        const res = await fetch("/api/photos/delete", {
+            method: "POST",
+            body: new URLSearchParams({ date: currentDate, items: [...selectedFiles].join(",") })
+        });
+        const data = await res.json();
+        if (data.ok) {
+            showToast(`已删除 ${data.count} 张照片`, "success");
+            selectedFiles.clear();
+            lastPhotoSig = "";   // 强制刷新
+            await refreshPhotos(currentDate);
+            loadDates();         // 日期数量变化
+        } else {
+            showToast(data.error || "删除失败", "error");
+        }
+    } catch (e) {
+        showToast("删除失败", "error");
+    }
 }
 
 function showToast(message, type = "info") {

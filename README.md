@@ -228,3 +228,13 @@ Restart=on-failure
 - 悬停提示防遮挡：CPU/NPU 按钮的提示气泡改为向侧栏内侧对齐（CPU 左对齐、NPU 右对齐），不再溢出被裁。
 - 优化推荐参数：删除说明行；置信度/间隔/确认三项并排一行；加载失败提示改显示在应用按钮上。
 - script.js 缓存破坏 `?v=4`。
+
+---
+
+## 10. 硬件加速状态（2026-08-30 实测）
+
+- **Tier 0 已生效**：MJPEG 预览限帧 10fps + q50（预览体积减半）。
+- **Tier A 已实现、暂关闭**：RGA 2D 加速 letterbox（ga_accel.py + ga_shim.cpp，依赖 /usr/local/lib/librga.so 官方预编译 1.10.6 与自编 ga_shim.so）。数值与 cv2 一致（mean diff 0.03）、墙钟快 45%。因设备当日两次假死（根因疑似 journald 20M 打满卡死 + 供电存疑），单元文件已加 Environment=RGA_ENABLED=0 回稳，稳定观察后再开。
+- **Tier B 进行中**：设备编译 mpp（librockchip_mpp）+ ffmpeg 6.1.2（--enable-rkmpp --enable-libdrm），完成后以 RTSP_BACKEND=mpp 接入 FrameReader（cv2 随时回退）。注意 mpp 仓库分支为 master。
+- **journald 修复**：曾打满 20M 上限（0B free，假死嫌疑之一），已配置 /etc/systemd/journald.conf.d/birding-fix.conf（SystemMaxUse=100M / SystemKeepFree=200M）。
+- 设备两个假死（09:17 前后与 10:30 前后）后均由 systemd 恢复服务，参数经 config.json 持久化无丢失。
