@@ -31,3 +31,7 @@ archive/
 
 # 部署助手（含局域网 SSH 凭据，不公开）
 _ssh_run.py
+
+# 内部评估报告 / 优化方案（仅本地留存，不纳入版本库、不上传 GitHub）
+birding_*.md
+birding_*.html
