@@ -60,7 +60,8 @@ birding/
 
 | 常量                            | 默认值                               | 含义                                                                    |
 | ----------------------------- | --------------------------------- | --------------------------------------------------------------------- |
-| `CAMERA_IP`                   | `192.168.2.222`                   | 摄像头 IP                                                                |
+| `CAMERA_IP`                   | `192.168.2.222`                   | 摄像头 IP（config.json 可覆盖；当前现场为 `192.168.2.162`）             |
+| `CAMERA_IP_FALLBACKS`         | 空（逗号分隔 IP 列表）            | 摄像头候选地址：主地址连续 4 次连接失败自动轮换（应对 DHCP 换址）        |
 | `USERNAME` / `PASSWORD`       | `root` / `1234qwer`               | 摄像头 RTSP 鉴权账号密码                                                       |
 | `CONF_THRESHOLD`              | `0.3`                             | 检测置信度阈值（也可 Web 实时调）                                                   |
 | `IOU_THRESHOLD`               | `0.3`                             | 连续帧匹配 IoU（去重匹配用）                                                      |
@@ -75,6 +76,7 @@ birding/
 | `RTSP_TRANSPORT`              | `tcp`                             | RTSP 传输协议（tcp 抗丢包；udp 易花屏）                                            |
 | `RTSP_STREAM`                 | `ch0_0.h264`                      | RTSP 路径；可改 `ch0_1.h264` 子码流降低解码压力与延迟                                  |
 | `RTSP_READ_TIMEOUT_SEC`       | `10`                              | RTSP 读超时（秒），死流时自动断开重连                                                 |
+| `OFFLINE_ALARM_SEC`           | `600`                             | OFFLINE 持续超过该秒数 `/healthz` 返回 503（配合外部巡检自愈）                                        |
 | `CONFIG_PATH`                 | `/home/birding/config.json`       | 运行时参数持久化文件（Web 修改的参数重启后自动恢复）                                          |
 | `DETECT_BACKEND`              | `cpu`                             | 检测后端：`cpu`（默认，兼容性强）或 `npu`（Rockchip NPU / float16 RKNN，约 12× 更快、精度一致） |
 | `NPU_MODEL_PATH`              | `/home/birding/yolov8n_fp16.rknn` | NPU 后端模型路径（float16 RKNN）                                              |
@@ -100,8 +102,8 @@ birding/
 | ---- | ----------------------------------------------------------- | ------------------------------------------ |
 | GET  | `/`                                                         | Web 主界面（实时预览 + 控制台）                        |
 | GET  | `/video_feed`                                               | MJPEG 实时视频流（带检测框）                          |
-| GET  | `/healthz`                                                  | 健康检查（探活用，返回 `{"status":"ok","state":...}`） |
-| GET  | `/status`                                                   | 服务状态 JSON（state / conf / camera / 统计）      |
+| GET  | `/healthz`                                                  | 健康检查分级：ERROR/DEAD、采集线程死亡、OFFLINE 超过 `OFFLINE_ALARM_SEC` 均返回 503（SLEEPING 休眠不算不健康） |
+| GET  | `/status`                                                   | 服务状态 JSON（state / conf / camera / 统计 + `frame_age_sec` / `last_error` / `camera_candidates`） |
 | GET  | `/api/photos?date=YYYYMMDD&limit=50`                        | 某日截图列表（含缩略图/原图 URL）                        |
 | GET  | `/api/dates`                                                | 有截图的日期列表及数量                                |
 | POST | `/update_camera` (form: `ip`)                               | 切换摄像头 IP 并自动重连                             |
@@ -168,11 +170,19 @@ WorkingDirectory=/home/birding
 ExecStart=/home/birding/venv/bin/python3 /home/birding/birding_service.py
 User=root
 Restart=on-failure
+Environment=DEBUG_MODE=false
+Environment=RGA_ENABLED=0        # 2026-09-06 假死排查后回退（见 §11）
+Environment=RTSP_BACKEND=cv2     # 同上：MPP 硬解与内核页表损坏相关，回退 cv2 软解
+Environment=PYTHONUNBUFFERED=1
+Environment=RTSP_IDLE_SEC=30
+Environment=OFFLINE_ALARM_SEC=600
+TimeoutStopSec=15
 ```
 
-> 主程序 `birding_service.py` 末尾带有 `if __name__ == "__main__": uvicorn.run(...)`，因此
-> `python3 birding_service.py` 与 `python3 -m uvicorn birding_service:app` 均可启动；install 脚本与
-> `birding.service` 已统一为前者。
+设备侧另已布置（不在仓库内，见 §11）：
+硬件看门狗（`system.conf.d/watchdog.conf` → `RuntimeWatchdogSec=10`）、
+`birding-health.timer`（每 5 分钟探活 /healthz，无响应自动重启服务）、
+`crash-watch.service`（每 5 秒落盘 `/root/crash_watch.log`：uptime/温度/内存/负载/网关探针）。
 
 ### 5.4 访问
 
@@ -274,15 +284,52 @@ Restart=on-failure
 
 ***
 
-## 10. 硬件加速状态（2026-09-01 固化确认）
+## 10. 硬件加速状态（2026-09-06 修订：MPP/RGA 已回退）
 
-- **Tier 0 已生效**：MJPEG 预览限帧 10fps + q50（预览体积减半）。
+- **Tier 0 保持生效**：MJPEG 预览限帧 10fps + q50（预览体积减半）。
 
-- **Tier A 已固化（2026-09-01）**：RGA 2D 加速 letterbox（rga\_accel.py + rga\_shim.cpp，依赖 /usr/local/lib/librga.so 官方预编译 1.10.6 与自编 rga\_shim.so）。数值与 cv2 一致（mean diff 0.03）、墙钟快 45%。单元文件 `Environment=RGA_ENABLED=1`（08-31 12:03 起生效）。**24h 观察期（08-31 12:03 → 09-01 12:03）soak 复核通过：全程 rga\_err\_lines=0，journal/dmesg 零 RGA 错误，服务连续运行 NRestarts=0，无假死/重启**。观察期正式关闭，RGA 保持启用。
+- **Tier A（RGA letterbox）与 Tier B（MPP 硬解）已于 2026-09-06 回退**：假死专项排查（§11）通过二分实验确认
+  二者的内核路径与"内核页表损坏 → 整机死亡"强相关——MPP+RGA 配置下带载 1.2~4.5 分钟内必死；
+  回退为 `RTSP_BACKEND=cv2`（软解拉流）+ `RGA_ENABLED=0` 后带载稳定运行 1 小时+。
+  **NPU 检测保留**（12× 加速不受影响）。如需重测硬件路径：`RGA_ENABLED=1 RTSP_BACKEND=mpp`
+  并 `systemctl daemon-reload && systemctl restart birding`（建议先读 §11 的取证方法）。
 
-- **Tier B 已生效并固化**：设备编译 mpp（librockchip\_mpp）+ ffmpeg 6.1.2（--enable-rkmpp --enable-libdrm），`RTSP_BACKEND=mpp` 生效（08-31 12:03 起与 RGA 叠加运行 24h 零异常）；cv2 随时回退。注意 mpp 仓库分支为 master。
+- **journald 修复（保持）**：SystemMaxUse=100M / SystemKeepFree=200M（/etc/systemd/journald.conf.d/birding-fix.conf）。
 
-- **journald 修复**：曾打满 20M 上限（0B free，假死嫌疑之一），已配置 /etc/systemd/journald.conf.d/birding-fix.conf（SystemMaxUse=100M / SystemKeepFree=200M）。
+***
 
-- 设备两个假死（08-30 09:17 前后与 10:30 前后）后均由 systemd 恢复服务，参数经 config.json 持久化无丢失；08-31 12:03 重启后连续稳定运行至今。
+## 11. 2026-09-06 假死专项排查与修复记录
+
+**现象**：板子（Panther X2 / RK3566）反复"假死"——典型模式为第 1 天正常、第 2 天发现无画面无照片；
+当天实测更恶化为开机 1~30 分钟内必死。
+
+**根因（三层，全部实锤）**：
+
+1. **主因：MPP/RGA 内核路径缺陷**。死亡瞬间崩溃监视器抓到内核页表损坏转储
+   （`page dumped because: still mapped when deleted` + `el0_ia` 用户态指令中止），且二分实验定位：
+   服务停用→稳定；MPP+RGA 开→必死；cv2+NPU→稳定 1 小时+。应用层代码不可能写坏内核页表。
+2. **叠加：摄像头 DHCP 换址**。摄像头由 192.168.2.222 迁至 192.168.2.162，服务指向旧地址导致
+   "进程活着但永远离线"的业务假死。已改 IP 并新增 `CAMERA_IP_FALLBACKS` 候选自动轮换。
+3. **关联：双网卡同网段双活**（eth0 + wlan1 各拿 DHCP）对低端路由器形成 ARP 双口应答/MAC 漂移与
+   DHCP 风暴压力（用户曾多次需重启路由器恢复网络）。已在崩溃监视器加网关探针，今后断网可直接归因
+   （`gw=DEAD` 且板子心跳连续 → 路由器死；心跳中断 → 板子死）。**建议只保留一个网络接口**。
+
+**已落地的修复**（代码提交 `48f377e` / `ff1c281`）：
+
+- 采集监护线程：采集线程意外退出自动重启（退避），杜绝静默假死；
+- `/healthz` 分级：ERROR/DEAD、线程死亡、长时间 OFFLINE 返回 503（不再假活）；
+- `/status` 新增 `frame_age_sec` / `last_error` / `camera_candidates`；
+- RTSP 超时参数 FFmpeg 6.1+ 兼容（stimeout+timeout 双设）；torch 线程上限（cpu-2）；
+- mppdec 日志改每连接截断；摄像头候选 IP 自动轮换。
+
+**设备侧防护体系**（不在仓库）：
+
+- 硬件看门狗 `RuntimeWatchdogSec=10`：内核挂死 ~15 秒自动重启（实测死亡→恢复仅 34 秒，全程无人值守）；
+- `birding-health.timer`：每 5 分钟探活 /healthz，无响应自动重启服务（对付"用户态冻死"形态）；
+- `crash-watch.service`：每 5 秒向 `/root/crash_watch.log`（eMMC）落盘 uptime/温度/内存/负载/网关探针，
+  充当"黑匣子"——每次死亡都有完整曲线可查。
+
+**遗留建议**：路由器后台绑定静态租约（板子/相机 MAC↔IP）；板子只保留一个网络接口；
+无 RTC 电池，务必保证 NTP 可用（否则照片归档日期与日志时间会错乱）；
+如需进一步定位 MPP 与 RGA 哪个是元凶，可单独重开 MPP（保持 RGA 关闭）做对照。
 
