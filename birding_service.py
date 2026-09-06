@@ -30,6 +30,12 @@ def _env(name, default, cast=str):
 CAMERA_IP = "192.168.2.222"
 USERNAME = "root"
 PASSWORD = "1234qwer"
+# 摄像头候选地址：主地址连接持续失败时自动轮换（应对 DHCP 换址；轮换不回写持久化配置）
+CAMERA_IP_FALLBACKS = [
+    ip.strip() for ip in _env("CAMERA_IP_FALLBACKS", "", str).split(",") if ip.strip()
+]
+CAMERA_IP_PRIMARY = CAMERA_IP   # /update_camera 与 config.json 维护的主地址
+_camera_ip_idx = 0
 
 CONF_THRESHOLD = _env("CONF_THRESHOLD", 0.3, float)
 IOU_THRESHOLD = _env("IOU_THRESHOLD", 0.3, float)          # 连续帧匹配 IoU
@@ -55,9 +61,20 @@ RTSP_BACKEND = _env("RTSP_BACKEND", "cv2", str).lower()
 FFMPEG_BIN = _env("FFMPEG_BIN", "/usr/local/bin/ffmpeg", str)
 MPPDEC_BIN = _env("MPPDEC_BIN", "/usr/local/bin/mppdec", str)
 RTSP_IDLE_SEC = _env("RTSP_IDLE_SEC", 10, int)   # 无帧空闲多久判定断流（慢码流可调大）
-# rtsp_transport=tcp 抗丢包；stimeout(μs) 保证死流时 read 在超时后返回，拉流线程不会永久阻塞
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
-                      f"rtsp_transport;{RTSP_TRANSPORT}|stimeout;{RTSP_READ_TIMEOUT_SEC * 1000000}")
+# rtsp_transport=tcp 抗丢包；stimeout(μs) 保证死流时 read 在超时后返回，拉流线程不会永久阻塞。
+# FFmpeg 6.1 起 RTSP socket 超时参数由 stimeout 改名 timeout：两个都设，未识别的会被 OpenCV 忽略（仅告警）
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    f"rtsp_transport;{RTSP_TRANSPORT}"
+    f"|stimeout;{RTSP_READ_TIMEOUT_SEC * 1000000}"
+    f"|timeout;{RTSP_READ_TIMEOUT_SEC * 1000000}")
+
+# 摄像头源类型（环境变量，运行期不随 Web 切换）：
+#   rtsp（默认，网络相机，完全兼容现状）| usb（UVC/V4L2 直连 USB 摄像头，30-60ms 低延迟、无网络依赖）
+# usb 时 USB_DEVICE_IDX 为 /dev/videoX 索引；USB2.0 下 720p30 必须 MJPG（YUYV 超带宽）
+CAMERA_TYPE = _env("CAMERA_TYPE", "rtsp", str).lower()
+USB_DEVICE_IDX = _env("USB_DEVICE_IDX", 0, int)
+USB_FOURCC = _env("USB_FOURCC", "MJPG", str).upper()
 
 # 运行时参数持久化（重启/断电后恢复，避免静默回退默认值）
 CONFIG_PATH = Path(_env("CONFIG_PATH", str(Path(__file__).resolve().parent / "config.json")))
@@ -74,7 +91,8 @@ IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
 def _save_config():
     try:
         data = {
-            "camera_ip": CAMERA_IP,
+            "camera_ip": CAMERA_IP_PRIMARY,
+            "camera_ip_fallbacks": CAMERA_IP_FALLBACKS,
             "conf": CONF_THRESHOLD,
             "iou_threshold": IOU_THRESHOLD,
             "debug_mode": DEBUG_MODE,
@@ -93,7 +111,7 @@ def _save_config():
 
 def _load_config():
     """启动时加载持久化参数（仅覆盖存在的键；凭据不持久化）。"""
-    global CAMERA_IP, CONF_THRESHOLD, IOU_THRESHOLD, DEBUG_MODE, SAVE_COOLDOWN
+    global CAMERA_IP, CAMERA_IP_PRIMARY, CAMERA_IP_FALLBACKS, CONF_THRESHOLD, IOU_THRESHOLD, DEBUG_MODE, SAVE_COOLDOWN
     global DETECT_EVERY_N_FRAMES, CONSECUTIVE_FRAMES_REQUIRED, DETECT_BACKEND
     global WORK_START, WORK_END
     try:
@@ -104,6 +122,11 @@ def _load_config():
             return
         if isinstance(data.get("camera_ip"), str) and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", data["camera_ip"]):
             CAMERA_IP = data["camera_ip"]
+            CAMERA_IP_PRIMARY = data["camera_ip"]
+        fbs = data.get("camera_ip_fallbacks")
+        if isinstance(fbs, list):
+            CAMERA_IP_FALLBACKS = [ip for ip in fbs
+                                   if isinstance(ip, str) and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip)]
         v = data.get("conf");
         if isinstance(v, (int, float)): CONF_THRESHOLD = max(0.1, min(0.9, float(v)))
         v = data.get("iou_threshold")
@@ -142,6 +165,8 @@ restart_event = threading.Event()  # 用于触发摄像头重新连接
 system_state = "INIT"
 frame_counter = 0
 save_counter = 0
+offline_since = None   # 进入 OFFLINE 的时刻（供 /healthz 判定长时间离线）
+last_error = ""        # 最近一次采集侧错误摘要（供 /status 展示）
 
 state_lock = threading.Lock()  # 保护跨线程共享状态（采集线程 <-> 视频流生成器）
 
@@ -275,6 +300,11 @@ def get_detector():
 
 def _build_detector():
     """返回 (detector, actual_backend)。NPU 构建失败时安全回退 CPU，并如实返回实际后端。"""
+    try:
+        import torch
+        torch.set_num_threads(max(1, (os.cpu_count() or 4) - 2))  # 4核板留2核给系统/网络，防推理独占
+    except Exception:
+        pass
     if DETECT_BACKEND == "npu":
         try:
             return NPUDetector(NPU_MODEL_PATH), "npu"
@@ -294,6 +324,19 @@ def rtsp_url():
 
 def rtsp_url_masked():
     return f"rtsp://{USERNAME}:***@{CAMERA_IP}:554/{RTSP_STREAM}"
+
+def rotate_camera_ip():
+    """连接持续失败时轮换候选摄像头地址（应对 DHCP 换址）；不修改持久化主地址。"""
+    global CAMERA_IP, _camera_ip_idx
+    cands = []
+    for ip in [CAMERA_IP_PRIMARY, CAMERA_IP] + list(CAMERA_IP_FALLBACKS):
+        if ip and ip not in cands:
+            cands.append(ip)
+    if len(cands) <= 1:
+        return None
+    _camera_ip_idx = (_camera_ip_idx + 1) % len(cands)
+    CAMERA_IP = cands[_camera_ip_idx]
+    return CAMERA_IP
 
 def in_work_time():
     now = datetime.now().time()
@@ -516,7 +559,7 @@ class FrameReaderMPP(threading.Thread):
         try:
             p1 = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL)
-            err_f = open("/tmp/mppdec_err.log", "ab")
+            err_f = open("/tmp/mppdec_err.log", "wb")  # 每次连接截断重写，防 tmpfs 无限增长
             p2 = subprocess.Popen(mpp_cmd, stdin=p1.stdout,
                                   stdout=subprocess.PIPE, stderr=err_f)
             p1.stdout.close()  # 让 p1 在 p2 退出后收到 SIGPIPE
@@ -585,10 +628,63 @@ class FrameReaderMPP(threading.Thread):
                     pass
         threading.Thread(target=_reap, daemon=True).start()
 
+class FrameReaderUSB(FrameReader):
+    """USB 摄像头（UVC/V4L2）直读线程：cv2 V4L2 打开 /dev/videoX 并强制 MJPEG 格式读取，
+    最新帧语义与 FrameReader 一致。USB2.0 下 720p30 必须 MJPEG（YUYV 超带宽）；
+    依赖内核 uvcvideo 驱动，打开失败/连续读帧失败置 fatal，由调用方回退 RTSP。"""
+
+    def __init__(self, idx=0, fourcc="MJPG"):
+        super().__init__(cap=None)
+        self.idx = idx
+        self.fourcc = fourcc
+        self.fatal = None
+        self.camera_desc = f"/dev/video{idx}"
+
+    def run(self):
+        try:
+            cap = cv2.VideoCapture(self.idx, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                self.fatal = f"USB 设备 {self.camera_desc} 打开失败（检查 uvcvideo 驱动与设备节点）"
+                return
+            if self.fourcc:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap = cap
+        except Exception as e:
+            self.fatal = f"USB 设备 {self.camera_desc} 初始化异常: {e}"
+            return
+        fail = 0
+        while not self.stopped.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                fail += 1
+                if fail > 30:            # 连续读取失败视为摄像头断开
+                    self.fatal = f"USB 读取连续失败（{self.camera_desc} 断开/驱动异常）"
+                    return
+                time.sleep(0.02)
+                continue
+            fail = 0
+            with self.lock:
+                self.frame = frame
+                self.ts = time.time()
+
+    def is_healthy(self):
+        return (self.is_alive() and self.fatal is None
+                and not self.stopped.is_set()
+                and self.cap is not None and self.cap.isOpened())
+
+    def stop(self):
+        super().stop()
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
+
 def capture_loop():
     global latest_frame, latest_frame_ts, latest_boxes, latest_confidences
     global system_state, frame_counter, consecutive_detector, detector
-    global CAMERA_IP, DETECT_BACKEND  # 确保使用最新值
+    global CAMERA_IP, DETECT_BACKEND, offline_since, last_error  # 确保使用最新值
 
     print(f"[{datetime.now()}] [启动] 观鸟系统启动")
     print(f"[{datetime.now()}] [配置] 阈值:{CONF_THRESHOLD}, 间隔:{DETECT_EVERY_N_FRAMES}帧, 确认:{CONSECUTIVE_FRAMES_REQUIRED}帧")
@@ -619,11 +715,33 @@ def capture_loop():
             continue
 
         system_state = "OFFLINE"
+        if offline_since is None:
+            offline_since = time.time()
         current_ip = CAMERA_IP  # 记录当前IP，用于检测变化
 
         reader = None
         cap = None
-        if RTSP_BACKEND == "mpp":
+
+        if CAMERA_TYPE == "usb":
+            # USB 摄像头：V4L2 直读（30-60ms 低延迟、无网络依赖）；失败回退 RTSP
+            try:
+                reader = FrameReaderUSB(USB_DEVICE_IDX, USB_FOURCC)
+                reader.start()
+                t0 = time.time()
+                while reader.is_alive() and not reader.fatal and reader.frame is None and time.time() - t0 < 25:
+                    time.sleep(0.2)
+                if reader.fatal or not reader.is_alive() or reader.frame is None:
+                    raise RuntimeError(reader.fatal or "USB 未在 25s 内出帧")
+                print(f"[{datetime.now()}] [状态] USB 摄像头已启动: {reader.camera_desc} (FOURCC={reader.fourcc})")
+            except Exception as e:
+                print(f"[{datetime.now()}] [警告] USB 摄像头打开失败，本次回退 RTSP: {e}")
+                try:
+                    reader.stop()
+                except Exception:
+                    pass
+                reader = None
+
+        if reader is None and RTSP_BACKEND == "mpp":
             try:
                 reader = FrameReaderMPP(rtsp_url())
                 reader.start()
@@ -653,6 +771,11 @@ def capture_loop():
             if not cap.isOpened():
                 # 无限重试 + 指数退避（2s→60s 封顶）；修复原 100 次后线程永久死亡问题
                 retry_count += 1
+                last_error = f"无法连接摄像头(连续{retry_count}次)"
+                if retry_count % 4 == 0:
+                    rotated = rotate_camera_ip()
+                    if rotated:
+                        print(f"[{datetime.now()}] [切换] 连接持续失败，轮换候选摄像头 -> {rotated}")
                 delay = min(60, 2 ** min(retry_count, 6))
                 print(f"[{datetime.now()}] [错误] 无法连接摄像头({retry_count})，{delay}秒后重试... [{rtsp_url_masked()}]")
                 stop_event.wait(delay)
@@ -661,15 +784,20 @@ def capture_loop():
             reader = FrameReader(cap)
             reader.start()
 
-        print(f"[{datetime.now()}] [状态] 摄像头连接成功: {CAMERA_IP} ({RTSP_TRANSPORT.upper()} / {RTSP_STREAM} / 拉流={RTSP_BACKEND})")
+        if CAMERA_TYPE == "usb":
+            print(f"[{datetime.now()}] [状态] USB 摄像头连接成功: {reader.camera_desc} (FOURCC={reader.fourcc})")
+        else:
+            print(f"[{datetime.now()}] [状态] 摄像头连接成功: {CAMERA_IP} ({RTSP_TRANSPORT.upper()} / {RTSP_STREAM} / 拉流={RTSP_BACKEND})")
         system_state = "RUNNING"
+        offline_since = None
+        last_error = ""
         retry_count = 0
         frame_counter = 0
         consecutive_detector.reset()
 
         while not stop_event.is_set() and in_work_time():
-            # 检查IP是否被修改
-            if CAMERA_IP != current_ip or restart_event.is_set():
+            # 检查是否需要切换摄像头源（IP 变更仅对 RTSP 有意义）
+            if CAMERA_TYPE != "usb" and (CAMERA_IP != current_ip or restart_event.is_set()):
                 print(f"[{datetime.now()}] [切换] IP变更 {current_ip} -> {CAMERA_IP}")
                 break  # 跳出内层循环，重新连接
 
@@ -802,9 +930,17 @@ def index(request: Request):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
+OFFLINE_ALARM_SEC = _env("OFFLINE_ALARM_SEC", 600, int)  # OFFLINE 持续超过该秒数视为不健康
+
 @app.get("/healthz")
 def healthz():
-    unhealthy = system_state in ("ERROR", "DEAD")
+    """探活分级：ERROR/DEAD、采集线程死亡、或工作状态下长时间 OFFLINE 均返回 503，
+    避免"进程活着但功能已死"的假活（SLEEPING 休眠时段不算不健康）。"""
+    t = capture_thread
+    thread_dead = t is not None and not t.is_alive()
+    offline_too_long = (system_state == "OFFLINE" and offline_since is not None
+                        and time.time() - offline_since > OFFLINE_ALARM_SEC)
+    unhealthy = system_state in ("ERROR", "DEAD") or thread_dead or offline_too_long
     return JSONResponse(
         content={"status": "unhealthy" if unhealthy else "ok", "state": system_state},
         status_code=503 if unhealthy else 200,
@@ -823,17 +959,22 @@ def status():
         "consecutive_required": CONSECUTIVE_FRAMES_REQUIRED,
         "frame_counter": frame_counter,
         "save_counter": save_counter,
-        "latest_boxes": len(latest_boxes)
+        "latest_boxes": len(latest_boxes),
+        "frame_age_sec": (round(time.time() - latest_frame_ts, 1) if latest_frame_ts else None),
+        "last_error": last_error,
+        "camera_candidates": [CAMERA_IP_PRIMARY] + list(CAMERA_IP_FALLBACKS),
     }
 
 @app.post("/update_camera")
 def update_camera(ip: str = Form(...)):
-    global CAMERA_IP
+    global CAMERA_IP, CAMERA_IP_PRIMARY, _camera_ip_idx
     ip = ip.strip()
     if not re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip) or any(int(o) > 255 for o in ip.split(".")):
         return {"ok": False, "message": "IP 格式无效，应为如 192.168.2.222 的 IPv4 地址"}
     old_ip = CAMERA_IP
     CAMERA_IP = ip
+    CAMERA_IP_PRIMARY = ip   # Web 设置的即为主地址
+    _camera_ip_idx = 0       # 重置轮换游标
     print(f"[{datetime.now()}] [配置] 摄像头IP: {old_ip} -> {ip}")
 
     # 触发重新连接
@@ -1021,6 +1162,30 @@ def video_feed():
                 time.sleep(0.1)
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
+def capture_supervisor():
+    """监护线程：采集线程意外退出时自动重启（带退避），避免静默假死；
+    RUNNING 且工作时段内长时间无新帧时置位 restart_event 兜底促请重连。"""
+    global capture_thread, system_state
+    restarts = 0
+    while not stop_event.is_set():
+        t = capture_thread
+        if t is not None and not t.is_alive():
+            restarts += 1
+            delay = min(60, 3 * (2 ** min(restarts - 1, 4)))
+            print(f"[{datetime.now()}] [监护] 采集线程已退出(第{restarts}次)，{delay}s 后重启")
+            system_state = "RESTARTING"
+            stop_event.wait(delay)
+            if stop_event.is_set():
+                break
+            capture_thread = threading.Thread(target=capture_loop, daemon=True)
+            capture_thread.start()
+        else:
+            restarts = 0
+            if (system_state == "RUNNING" and in_work_time()
+                    and time.time() - latest_frame_ts > max(60, RTSP_IDLE_SEC * 2)):
+                restart_event.set()
+        stop_event.wait(30)
+
 # ======================
 # 启动采集线程 & 入口
 # ======================
@@ -1029,6 +1194,7 @@ def video_feed():
 
 capture_thread = threading.Thread(target=capture_loop, daemon=True)
 capture_thread.start()
+threading.Thread(target=capture_supervisor, daemon=True).start()
 
 if __name__ == "__main__":
     import uvicorn

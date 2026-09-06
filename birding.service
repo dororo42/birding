@@ -11,6 +11,12 @@ User=root
 WorkingDirectory=/home/birding
 # 生产默认关闭调试（非鸟不入库）；可用环境变量覆盖其它参数
 Environment=DEBUG_MODE=false
+# 与主机运行状态保持一致（2026-09-01 固化后对齐）：
+# RGA 2D 加速启用、MPP 硬解拉流、日志即时刷新、无帧 30s 判断流
+Environment=RGA_ENABLED=1
+Environment=RTSP_BACKEND=mpp
+Environment=PYTHONUNBUFFERED=1
+Environment=RTSP_IDLE_SEC=30
 # 停机给 lifespan 优雅退出留足时间（正常应在 1-2s 内退出）
 TimeoutStopSec=15
 # 主程序已内置 __main__ 入口（uvicorn.run），直接运行即可启动 Web 服务

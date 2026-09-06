@@ -80,6 +80,11 @@ Type=simple
 User=root
 WorkingDirectory=$APP_DIR
 Environment=DEBUG_MODE=false
+# 与主机运行状态保持一致（2026-09-01 固化后对齐）：RGA 加速、MPP 硬解、日志即时刷新、30s 断流判定
+Environment=RGA_ENABLED=1
+Environment=RTSP_BACKEND=mpp
+Environment=PYTHONUNBUFFERED=1
+Environment=RTSP_IDLE_SEC=30
 TimeoutStopSec=15
 ExecStart=$VENV_DIR/bin/python3 $APP_DIR/$PY_FILE
 Restart=on-failure
