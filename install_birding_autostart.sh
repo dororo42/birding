@@ -80,11 +80,12 @@ Type=simple
 User=root
 WorkingDirectory=$APP_DIR
 Environment=DEBUG_MODE=false
-# 与主机运行状态保持一致（2026-09-01 固化后对齐）：RGA 加速、MPP 硬解、日志即时刷新、30s 断流判定
-Environment=RGA_ENABLED=1
-Environment=RTSP_BACKEND=mpp
+# 2026-09-06 假死排查后固化：MPP/RGA 与内核页表损坏强相关，回退 cv2 软解；NPU 检测保留
+Environment=RGA_ENABLED=0
+Environment=RTSP_BACKEND=cv2
 Environment=PYTHONUNBUFFERED=1
 Environment=RTSP_IDLE_SEC=30
+Environment=OFFLINE_ALARM_SEC=600
 TimeoutStopSec=15
 ExecStart=$VENV_DIR/bin/python3 $APP_DIR/$PY_FILE
 Restart=on-failure
