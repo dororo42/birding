@@ -35,3 +35,6 @@ _ssh_run.py
 # 内部评估报告 / 优化方案（仅本地留存，不纳入版本库、不上传 GitHub）
 birding_*.md
 birding_*.html
+# 空格命名变体（如「birding 项目评估与…报告20260908.md」）同样不上传
+birding *.md
+birding *.html
